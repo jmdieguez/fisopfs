@@ -98,9 +98,13 @@ manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ ls
 asd.txt
 ```
 
-## Múltiples subdirectorios anidados
+---
 
-Para este trabajo se decidió realizar dicho desafío, donde se pide soportar: 
+## Desafíos
+
+### Múltiples subdirectorios anidados
+
+Se pide soportar: 
 
 * Más de dos niveles de directorios.
 * Se debe implementar una cota máxima a los niveles de directorios y a la longitud del path.
@@ -136,3 +140,95 @@ manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/a/b/c/d/e/f/g$ touch aaaaaaaaa
 touch: cannot touch 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': Numerical result out of range
 
 ```
+
+### Permisos y ownership
+
+El filesystem soporta el cambio de permisos y ownership respectivos a un archivo o directorio. Por ejemplo, si contamos con dos usuarios:
+
+* manu
+* test
+
+y un grupo:
+
+* grupo
+
+Cuando recién creamos el archivo, podemos tanto escribir como leerlo, debido a que el uid es igual al usuario "manu", y los permisos respectivos al uid de lectura y escritura (4 + 2).
+
+```
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ echo "hola mundo" > archivo
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ stat archivo
+  File: archivo
+  Size: 11        	Blocks: 1          IO Block: 4096   regular file
+Device: 34h/52d	Inode: 4           Links: 1
+Access: (0664/-rw-rw-r--)  Uid: ( 1000/    manu)   Gid: ( 1000/    manu)
+Access: 2022-12-20 18:55:58.000000000 -0300
+Modify: 2022-12-20 18:55:55.000000000 -0300
+Change: 2022-12-20 18:55:55.000000000 -0300
+ Birth: -
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ cat archivo
+hola mundo
+```
+
+Ahora bien, si cambiamos el ownership del archivo con chown a {uid = test, gid = grupo} (cabe aclarar que manu no pertenece al grupo "grupo"), los permisos que tendremos son respectivos a "other", por ende, el modo es únicamente de lectura (4). Cuando tratamos de escribir nuevamente en el archivo, lógicamente no podemos hacerlo debido a que no tiene los permisos suficientes.
+
+```
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ chown test:grupo archivo
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ stat archivo
+  File: archivo
+  Size: 11        	Blocks: 1          IO Block: 4096   regular file
+Device: 34h/52d	Inode: 4           Links: 1
+Access: (0664/-rw-rw-r--)  Uid: ( 1001/    test)   Gid: ( 1002/   grupo)
+Access: 2022-12-20 18:56:27.000000000 -0300
+Modify: 2022-12-20 18:55:55.000000000 -0300
+Change: 2022-12-20 18:56:25.000000000 -0300
+ Birth: -
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ echo "chau" >> archivo
+bash: echo: write error: Permission denied
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ cat archivo
+hola mundo
+```
+
+En el caso de los directorios, al momento de crearlos estos tienen los permisos de lectura, escritura, y ejecución. Cabe aclarar que no se tienen en cuenta los permisos de ejecución al momento de acceder a los directorios.
+
+Si un directorio tiene permiso de escritura, entonces se le permite la creación y eliminación de directorios.
+```
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ ls
+archivo  dir
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ stat dir
+  File: dir
+  Size: 0         	Blocks: 0          IO Block: 4096   directory
+Device: 34h/52d	Inode: 3           Links: 3
+Access: (0751/drwxr-x--x)  Uid: ( 1000/    manu)   Gid: ( 1000/    manu)
+Access: 2022-12-20 18:59:31.000000000 -0300
+Modify: 2022-12-20 08:20:01.000000000 -0300
+Change: 2022-12-20 18:59:11.000000000 -0300
+ Birth: -
+```
+Si un directorio tiene permiso de escritura, entonces se le permite la creación y eliminación de directorios.
+```
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ cd dir
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ ls
+abc.txt
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ touch otro.archivo
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ ls
+abc.txt  otro.archivo
+```
+Por ende, si cambiamos el modo del directorio a, por ejemplo, solo lectura y ejecución, no deberíamos poder eliminar el archivo que acabamos de crear.
+```
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ cd ..
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ chmod 551 dir
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ cd dir
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ rm otro.archivo
+rm: cannot remove 'otro.archivo': Permission denied
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ ls
+abc.txt  otro.archivo
+```
+Por otro lado, si el directorio no cuenta con permisos de lectura, entonces no es posible leer los archivos que contiene:
+```
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ cd ..
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ chmod 151 dir
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount$ cd dir
+manu@manu:~/Desktop/sisop_2022b_g23/fisopfs/mount/dir$ ls
+ls: reading directory '.': Permission denied
+```
+
