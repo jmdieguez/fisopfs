@@ -9,75 +9,9 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <ctype.h>
-
-#define FS_FILENAME_LEN 64
-
-#define BLOCK_SIZE 256
-#define N_BLOCKS 256
-
-#define N_INODES 64  // 1 inode : 4 blocks ratio
-
-#define N_FILES_DIR 16
-
-#define N_BLOCKS_INODE 16  // files max size = 4096 bytes
-
-#define SUPERBLOCK_MAGIC 123456
-#define MAX_FILE_NAME_SIZE 50
-
-#define MAX_DEPTH_DIR 8
+#include "fisopfs.h"
 
 char file_name[MAX_FILE_NAME_SIZE] = "file_system.fisopfs";
-
-struct superblock {
-	int magic;
-	int n_files;
-	int n_dirs;
-};
-
-struct bmap_blocks {
-	int free_blocks[N_BLOCKS];
-};
-
-struct bmap_inodes {
-	int free_inodes[N_INODES];
-};
-
-struct block {
-	char content[N_BLOCKS];
-	int free_space;
-	int ref;  // reference to next data block
-};
-
-struct file {
-	char path[FS_FILENAME_LEN];
-	char filename[FS_FILENAME_LEN];  // filename used by FUSE filler
-	int d_ino;                       // inode number
-};
-
-struct dirent {
-	int n_dir;
-	char path[FS_FILENAME_LEN];
-	char dirname[FS_FILENAME_LEN];  // dirname used by FUSE filler
-	int d_ino;                      // inode number
-	int n_files;
-	int files[N_FILES_DIR];
-	int parent;
-    int level;
-};
-
-struct inode {
-	mode_t st_mode;      // protection
-	nlink_t st_nlink;    // number of hard links
-	uid_t st_uid;        // user ID of owner
-	gid_t st_gid;        // group ID of owner
-	off_t st_size;       // total size, in bytes
-	int ref;             // reference to the first data block
-	blkcnt_t st_blocks;  // number of blocks allocated
-	time_t st_atime;     // time of last access
-	time_t st_mtime;     // time of last modification
-	time_t st_ctime;     // time of last status change
-	time_t st_btime;     // time of birth
-};
 
 struct superblock *sb;
 struct bmap_inodes *bitmap_inodes;
@@ -86,6 +20,47 @@ struct inode *inodes;
 struct block *blocks;
 struct file *files;
 struct dirent *dirs;
+
+int
+check_read_permissions(struct inode *inode)
+{
+	struct fuse_context *context = fuse_get_context();
+	int access;
+	if (context->uid == inode->st_uid) {
+		access = inode->st_mode & S_IRUSR;
+	} else if (context->uid == inode->st_gid) {
+		access = inode->st_mode & S_IRGRP;
+	} else {
+		access = inode->st_mode & S_IROTH;
+	}
+
+	if (access == 0) {
+		printf("[debug] permission denied \n");
+		return 0;
+	}
+
+	return 1;
+}
+
+int
+check_write_permissions(struct inode *inode)
+{
+	struct fuse_context *context = fuse_get_context();
+	int access;
+	if (context->uid == inode->st_uid) {
+		access = inode->st_mode & S_IWUSR;
+	} else if (context->uid == inode->st_gid) {
+		access = inode->st_mode & S_IWGRP;
+	} else {
+		access = inode->st_mode & S_IWOTH;
+	}
+	if (access == 0) {
+		printf("[debug] permission denied \n");
+		return 0;
+	}
+
+	return 1;
+}
 
 int
 get_name_index(const char *path)
@@ -125,9 +100,8 @@ init_inode(mode_t mode)
 			inodes[i].st_size = 0;
 			inodes[i].st_blocks = 0;
 
-			inodes[i].st_btime = inodes[i].st_atime =
-			        inodes[i].st_mtime = inodes[i].st_ctime =
-			                time(NULL);
+			inodes[i].st_atime = inodes[i].st_mtime =
+			        inodes[i].st_ctime = time(NULL);
 
 			inodes[i].ref = -1;
 
@@ -229,15 +203,27 @@ get_dir(const char *path)
 	return NULL;
 }
 
-void
+int
 add_file(const char *filename, mode_t mode)
 {
 	struct dirent *dir = get_dir(filename);
+
+	struct inode *inode = &inodes[dir->d_ino];
+
+	if (!check_write_permissions(inode)) {
+		return 0;
+	}
+
 	int n_file = init_file(filename, mode);
+
 	if (dir && (n_file >= 0))
 		dir->files[dir->n_files++] = n_file;
-	else
+	else {
 		printf("[debug] ERROR while creating file \n");
+		return 0;
+	}
+
+	return 1;
 }
 
 int
@@ -247,6 +233,18 @@ get_file_index(const char *path)
 
 	for (int i = 0; i <= sb->n_files; i++)
 		if (strcmp(path, files[i].path) == 0)
+			return i;
+
+	return -1;
+}
+
+int
+get_dir_index(const char *path)
+{
+	path++;
+
+	for (int i = 0; i <= sb->n_dirs; i++)
+		if (strcmp(path, dirs[i].path) == 0)
 			return i;
 
 	return -1;
@@ -348,7 +346,7 @@ fisopfs_init(struct fuse_conn_info *conn)
 
 		struct dirent root;
 
-		int i = init_inode(0);
+		int i = init_inode(__S_IFDIR | 0775);
 
 		if (i < 0) {
 			printf("[debug] error while initializing root dir \n");
@@ -360,7 +358,7 @@ fisopfs_init(struct fuse_conn_info *conn)
 		strcpy(root.path, "/");
 		root.n_files = 0;
 		root.n_dir = 0;
-        root.level = 1;
+		root.level = 1;
 
 		dirs[0] = root;
 
@@ -405,27 +403,37 @@ fisopfs_destroy(void *a)
 	free(dirs);
 }
 
-
 static int
 fisopfs_getattr(const char *path, struct stat *st)
 {
 	printf("\n[debug] fisopfs_getattr(%s) \n", path);
 
-	st->st_gid = getgid();
-	st->st_uid = getuid();
-	st->st_atime = time(NULL);
-	st->st_mtime = time(NULL);
-	st->st_ctime = time(NULL);
+	ino_t i;
+	struct inode *inode;
+
 	if ((strcmp(path, "/") == 0) || is_dir(path)) {
-		st->st_mode = __S_IFDIR | 0755;
-		st->st_nlink = 2;
+		i = get_dir_index(path);
+		inode = &inodes[dirs[i].d_ino];
+		st->st_nlink = 3;
+
 	} else if (is_file(path)) {
-		st->st_mode = __S_IFREG | 0644;
-		st->st_size = 2048;
+		i = get_file_index(path);
+		inode = &inodes[files[i].d_ino];
 		st->st_nlink = 1;
+		st->st_size = inode->st_size;
 	} else {
 		return -ENOENT;
 	}
+
+	st->st_mode = inode->st_mode;
+	st->st_ino = i;
+	st->st_gid = inode->st_gid;
+	st->st_uid = inode->st_uid;
+	inode->st_atime = time(NULL);
+	st->st_atime = inode->st_atime;
+	st->st_mtime = inode->st_mtime;
+	st->st_ctime = inode->st_ctime;
+	st->st_blocks = inode->st_blocks;
 
 	return 0;
 }
@@ -442,23 +450,19 @@ fisopfs_readdir(const char *path,
 	filler(buffer, ".", NULL, 0);
 	filler(buffer, "..", NULL, 0);
 
-
 	struct dirent *dir = NULL;
-
 	if (strcmp(path, "/") == 0)
 		dir = &dirs[0];
 
 	else {
-		for (int i = 0; i < sb->n_dirs; i++) {
-			struct dirent *it = &dirs[i];
-			if (it && strcmp(it->path, path + 1) == 0) {
-				dir = it;
-				break;
-			}
-		}
+		dir = &dirs[get_dir_index(path)];
 	}
 
 	if (dir != NULL) {
+		if (!check_read_permissions(&inodes[dir->d_ino])) {
+			return PERMISSION_DENIED;
+		}
+
 		for (int j = 0; j < dir->n_files; j++) {  // Fill files
 
 			int n_file = dir->files[j];
@@ -487,8 +491,11 @@ fisopfs_mknod(const char *path, mode_t mode, dev_t rdev)
 	printf("\n[debug] fisopfs_mknod(%s) \n", path);
 
 	if (!is_file(path) && strlen(path) < FS_FILENAME_LEN) {
-		add_file(path, mode);
-		return 0;
+		if (add_file(path, mode))
+			return 0;
+
+		else
+			return PERMISSION_DENIED;
 	}
 
 	printf("\n[debug] file %s already exists, or name is too large!\n", path);
@@ -503,13 +510,16 @@ fisopfs_create(const char *path, mode_t mode, struct fuse_file_info *info)
 	printf("\n[debug] fisopfs_create(%s) \n", path);
 
 	if (!is_file(path) && strlen(path) < FS_FILENAME_LEN) {
-		add_file(path, mode);
-		return 0;
+		if (add_file(path, mode))
+			return 0;
+
+		else
+			return PERMISSION_DENIED;
 	}
 
 	printf("\n[debug] file %s already exists, or name is too large! \n", path);
 
-	return 1;
+	return 0 - EEXIST;
 }
 
 /** Read file */
@@ -521,50 +531,55 @@ fisopfs_read(const char *path,
              struct fuse_file_info *fi)
 {
 	printf("\n[debug] fisopfs_read(%s, %ld, %ld) \n", path, size, offset);
-	path++;
 
-	for (int i = 0; i < sb->n_files; i++) {
-		struct file *aux = &files[i];
-		if (strcmp(aux->path, path) == 0) {
-			struct inode *inode = &inodes[aux->d_ino];
+	int i = get_file_index(path);
 
-			char *content;
-			content = calloc(1, BLOCK_SIZE * inode->st_blocks);
-			printf("[debug] reading content from %ld blocks \n",
-			       inode->st_blocks);
-			strcpy(content, "");
-			memset(buffer, 0, size);
-			size_t len = 0;
-			int id_block = inode->ref;
-
-			if (id_block >= 0) {
-				for (int j = 0; j < inode->st_blocks;
-				     j++) {  // Iterate through blocks from an inode
-					struct block *block = &blocks[id_block];
-					printf("[debug] reading absolute block "
-					       "%d\n",
-					       id_block);
-					len += BLOCK_SIZE - block->free_space;
-					strncat(content,
-					        block->content,
-					        BLOCK_SIZE - block->free_space);  // Concatenate their content
-
-					id_block = block->ref;
-				}
-
-				printf("[debug] len : %ld \n", len);
-				memcpy(buffer,
-				       content,
-				       len);  // Copy the content into buffer
-				free(content);
-			}
-
-			return (int) size;
-		}
+	if (i < 0) {
+		printf("[debug] read failed. does your file exist? \n");
+		return 0;
 	}
 
-	printf("[debug] read failed. is your file open? \n");
-	return 0;
+	struct file *file = &files[i];
+	struct inode *inode = &inodes[file->d_ino];
+
+	if (!check_read_permissions(inode)) {
+		return PERMISSION_DENIED;
+	}
+
+	inode->st_atime = time(NULL);
+
+	char *content;
+	content = calloc(1, BLOCK_SIZE * inode->st_blocks);
+	printf("[debug] reading content from %ld blocks \n", inode->st_blocks);
+	strcpy(content, "");
+	memset(buffer, 0, size);
+	size_t len = 0;
+	int id_block = inode->ref;
+
+	if (id_block >= 0) {
+		for (int j = 0; j < inode->st_blocks;
+		     j++) {  // Iterate through blocks from an inode
+			struct block *block = &blocks[id_block];
+			printf("[debug] reading absolute block "
+			       "%d\n",
+			       id_block);
+			len += BLOCK_SIZE - block->free_space;
+			strncat(content,
+			        block->content,
+			        BLOCK_SIZE - block->free_space);  // Concatenate their content
+
+			id_block = block->ref;
+		}
+
+		printf("[debug] len : %ld \n", len);
+
+		memcpy(buffer, content,
+		       len);  // Copy the content into buffer
+
+		free(content);
+	}
+
+	return (int) size;
 }
 
 void
@@ -590,6 +605,82 @@ flush_blocks(struct inode *inode)
 	}
 	inode->st_blocks = 0;
 	inode->ref = -1;
+	inode->st_size = 0;
+}
+
+void
+write_content(struct inode *inode, const char *buffer, size_t size)
+{
+	int written = 0;
+	int id_block = inode->ref;
+	struct block *block = NULL;
+	struct block *aux = NULL;
+
+	if (id_block >= 0) {
+		aux = &blocks[id_block];
+	}
+
+	while (written != size) {
+		if (id_block >= 0)
+			block = &blocks[id_block];
+
+		if (!block ||  // If memory needed
+		    block->free_space == 0) {
+			if (inode->st_blocks < N_BLOCKS_INODE) {
+				id_block = init_block();  // Initialize block
+
+				block = &blocks[id_block];
+
+				if (aux)
+					aux->ref = id_block;
+
+				else
+					inode->ref = id_block;
+
+				aux = block;
+				printf("[debug] Initialize "
+				       "block n: %d \n",
+				       id_block);
+
+				printf("[debug] Inode %p now "
+				       "has %ld blocks "
+				       "assigned\n",
+				       inode,
+				       ++inode->st_blocks);
+
+			} else {
+				printf("[debug] Inode %p can't "
+				       "initialize more "
+				       "blocks\n",
+				       inode);
+				break;
+			}
+		}
+
+		int block_offset = BLOCK_SIZE - block->free_space;
+
+		printf("[debug] writing absolute block %d\n", id_block);
+
+		if (size > block->free_space) {
+			strncpy(block->content + block_offset,
+			        buffer + written,
+			        block->free_space);
+			written += block->free_space;
+			block->free_space = 0;
+		}
+
+		else {
+			strncpy(block->content + block_offset,
+			        buffer + written,
+			        size);
+			written += (int) size;
+			block->free_space -= (int) size;
+		}
+
+		id_block = blocks[id_block].ref;
+	}
+
+	inode->st_size += written;
 }
 
 /** Write to file */
@@ -603,93 +694,29 @@ fisopfs_write(const char *path,
 	printf("\n[debug] fisopfs_write(%s) \n", path);
 	printf("[debug] writing %ld bytes in %s \n", size, path);
 	printf("[debug] offset: %ld \n", offset);
-	path++;
 
-	int written = 0;
-	for (int i = 0; i < sb->n_files; i++) {
-		struct file *file = &files[i];
-		if (file && strcmp(file->path, path) == 0) {
-			printf("[debug] found %s \n", path);
-			struct inode *inode = &inodes[file->d_ino];
-			if (offset == 0)
-				flush_blocks(inode);
+	int i = get_file_index(path);
 
-			int id_block = inode->ref;
-			struct block *block = NULL;
-			struct block *aux = NULL;
-
-			if (id_block >= 0) {
-				aux = &blocks[id_block];
-			}
-
-			while (written != size) {
-				if (id_block >= 0)
-					block = &blocks[id_block];
-
-				if (!block ||  // If memory needed
-				    block->free_space == 0) {
-					if (inode->st_blocks < N_BLOCKS_INODE) {
-						id_block =
-						        init_block();  // Initialize block
-
-						block = &blocks[id_block];
-
-						if (aux)
-							aux->ref = id_block;
-
-						else
-							inode->ref = id_block;
-
-						aux = block;
-						printf("[debug] Initialize "
-						       "block n: %d \n",
-						       id_block);
-
-						printf("[debug] Inode %p now "
-						       "has %ld blocks "
-						       "assigned\n",
-						       inode,
-						       ++inode->st_blocks);
-
-					} else {
-						printf("[debug] Inode %p can't "
-						       "initialize more "
-						       "blocks\n",
-						       inode);
-						break;
-					}
-				}
-
-				int block_offset = BLOCK_SIZE - block->free_space;
-
-				printf("[debug] writing absolute block %d\n",
-				       id_block);
-
-				if (size > block->free_space) {
-					strncpy(block->content + block_offset,
-					        buffer + written,
-					        block->free_space);
-					written += block->free_space;
-					block->free_space = 0;
-				}
-
-				else {
-					strncpy(block->content + block_offset,
-					        buffer + written,
-					        size);
-					written += (int) size;
-					block->free_space -= (int) size;
-				}
-
-				id_block = blocks[id_block].ref;
-			}
-
-			return (int) size;
-		}
+	if (i < 0) {
+		printf("[debug] write failed. does your file exist? \n");
+		return -1;
 	}
 
-	printf("[debug] write failed. is your file open? \n");
-	return -1;
+	struct file *file = &files[i];
+
+	printf("[debug] found %s \n", file->path);
+	struct inode *inode = &inodes[file->d_ino];
+
+	if (!check_write_permissions(inode)) {
+		return PERMISSION_DENIED;
+	}
+
+	inode->st_atime = time(NULL);
+	inode->st_mtime = time(NULL);
+
+	write_content(inode, buffer, size);
+
+	return (int) size;
 }
 
 void
@@ -717,6 +744,11 @@ fisopfs_unlink(const char *path)
 
 	struct file *file = &files[i];
 	struct dirent *dir = get_dir(path);
+	struct inode *inode = &inodes[dir->d_ino];
+
+	if (!check_write_permissions(inode)) {
+		return PERMISSION_DENIED;
+	}
 
 	for (int j = 0; j < dir->n_files; j++) {
 		if (&files[dir->files[j]] == file) {
@@ -733,30 +765,38 @@ fisopfs_unlink(const char *path)
 static int
 fisopfs_mkdir(const char *path, mode_t mode)
 {
-	printf("\n[debug] fisopfs_mkdir(%s) \n", path);
+	printf("\n[debug] fisopfs_mkdir(%s, %d) \n", path, mode);
 	struct dirent *parent = get_dir(path);
 	printf("\n[debug] parent is: %s \n", parent->path);
-    printf("[debug] parent level is %d \n", parent->level);
-    printf("[debug] path strlen is %ld \n", strlen(path) );
+	printf("[debug] parent level is %d \n", parent->level);
+	printf("[debug] path strlen is %ld \n", strlen(path));
 
-    if (parent->level < MAX_DEPTH_DIR && ( strlen(path) < FS_FILENAME_LEN) ) {
+	struct inode *inode = &inodes[parent->d_ino];
 
-        path++;
-        int i = init_inode(mode);
-        if (i > -1) {
-            struct dirent new_dir;  // Initialize new dir
-            new_dir.n_files = 0;
-            strcpy(new_dir.path, path);
-            strcpy(new_dir.dirname, path + get_name_index(path));
-            new_dir.d_ino = i;
-            new_dir.parent = parent->n_dir;
-            new_dir.level = parent->level + 1;
-            new_dir.n_dir = sb->n_dirs;
-            dirs[sb->n_dirs++] = new_dir;
+	if (!check_write_permissions(inode)) {
+		return PERMISSION_DENIED;
+	}
 
-            return 0;
-        }
-    }
+	inode->st_atime = time(NULL);
+	inode->st_mtime = time(NULL);
+
+	if (parent->level < MAX_DEPTH_DIR && (strlen(path) < FS_FILENAME_LEN)) {
+		path++;
+		int i = init_inode(__S_IFDIR | 0775);
+		if (i > -1) {
+			struct dirent new_dir;  // Initialize new dir
+			new_dir.n_files = 0;
+			strcpy(new_dir.path, path);
+			strcpy(new_dir.dirname, path + get_name_index(path));
+			new_dir.d_ino = i;
+			new_dir.parent = parent->n_dir;
+			new_dir.level = parent->level + 1;
+			new_dir.n_dir = sb->n_dirs;
+			dirs[sb->n_dirs++] = new_dir;
+
+			return 0;
+		}
+	}
 
 	return 1;
 }
@@ -770,6 +810,15 @@ fisopfs_rmdir(const char *path)
 	for (int i = 0; i < sb->n_dirs; i++) {
 		struct dirent *dir = &dirs[i];
 		if (strcmp(dir->path, path) == 0) {
+			struct dirent *parent = &dirs[dir->parent];
+			struct inode *inode = &inodes[parent->d_ino];
+
+			if (!check_write_permissions(inode))
+				return PERMISSION_DENIED;
+
+			inode->st_atime = time(NULL);
+			inode->st_mtime = time(NULL);
+
 			for (int j = 0; j < dir->n_files; j++)
 				remove_file(&files[dir->files[j]]);  // Remove contained files
 			bitmap_inodes->free_inodes[dir->d_ino] =
@@ -799,23 +848,78 @@ fisopfs_getxattr(const char *a, const char *b, char *c, size_t s)
 	return 0;
 }
 
-int
-fisopfs_chown(const char *path, uid_t uid, gid_t gid)
+static int
+fisopfs_chmod(const char *path, mode_t mode)
 {
-	printf("\n[debug] fisopfs_chown(%s, %d, %d) \n", path, uid, gid);
+	printf("\n[debug] fisopfs_chmod(%s, %d) \n", path, mode);
+	struct inode *inode;
+
 	int i = get_file_index(path);
-	struct file *file = &files[i];
-	struct inode *inode = &inodes[file->d_ino];
-	inode->st_uid = uid;
-	inode->st_gid = gid;
+	if (i < 0) {
+		i = get_dir_index(path);
+		if (i < 0)
+			return -1;
+		inode = &inodes[dirs[i].d_ino];
+	}
+
+	else {
+		inode = &inodes[files[i].d_ino];
+	}
+
+	inode->st_atime = time(NULL);
+	inode->st_ctime = time(NULL);
+
+	struct fuse_context *context = fuse_get_context();
+
+	printf("[debug] context_uid(%d) - uid(%d) \n", context->uid, inode->st_uid);
+	if (inode->st_uid == context->uid)
+		inode->st_mode = mode;
+
+	printf("[debug] inode in mode %d \n", inode->st_mode);
 
 	return 0;
 }
 
-int
+static int
+fisopfs_chown(const char *path, uid_t uid, gid_t gid)
+{
+	printf("\n[debug] fisopfs_chown(%s, %d, %d) \n", path, uid, gid);
+
+	int i = get_file_index(path);
+	if (i < 0)
+		return -1;
+	struct file *file = &files[i];
+
+	struct inode *inode = &inodes[file->d_ino];
+
+	inode->st_atime = time(NULL);
+	inode->st_ctime = time(NULL);
+
+	if (uid != -1) {
+		inode->st_uid = uid;
+	}
+
+	if (gid != -1) {
+		inode->st_gid = gid;
+	}
+
+	return 0;
+}
+
+static int
 fisopfs_truncate(const char *path, off_t offset)
 {
 	printf("\n[debug] fisopfs_truncate(%s, %ld) \n", path, offset);
+
+	int i = get_file_index(path);
+	if (i < 0)
+		return -1;
+	struct file *file = &files[i];
+
+	printf("[debug] found %s \n", path);
+	struct inode *inode = &inodes[file->d_ino];
+	flush_blocks(inode);
+
 	return 0;
 }
 
@@ -833,6 +937,7 @@ static struct fuse_operations operations = {
 	.init = fisopfs_init,
 	.getxattr = fisopfs_getxattr,
 	.chown = fisopfs_chown,
+	.chmod = fisopfs_chmod,
 	.truncate = fisopfs_truncate,
 	.destroy = fisopfs_destroy,
 };
